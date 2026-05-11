@@ -1303,21 +1303,94 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p) {
         LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt contains multimodal chunks (unsupported)\n");
         return false;
     }
+    if (disk_dir.empty() || p.data.empty() || p.tokens.n_tokens() <= 0) {
+        return false;
+    }
 
-    (void)p;
-    // TODO Phase 1.5:
-    //   1. build kv_file_header with token_count, data_size, n_kept_prompt,
-    //      n_discarded_prompt, creation_time = ggml_time_us().
-    //   2. write to <disk_dir>/prompt-<next_disk_id>.kv.tmp
-    //      sequence: header, tokens (u32 LE), p.data bytes.
-    //   3. rename .tmp -> .kv (atomic on btrfs). Sync I/O is intentional for
-    //      Phase 1.5; revisit with a background thread only if latency
-    //      measurements under concurrent load justify the added complexity.
-    //   4. p.disk_file = "prompt-<id>.kv"
-    //      p.data_disk_size = data.size()
-    //      p.data.clear(); p.data.shrink_to_fit();
-    //   5. ++next_disk_id; enforce_disk_limit().
-    return false;
+    namespace fs = std::filesystem;
+
+    const int64_t t_start = ggml_time_us();
+
+    std::error_code ec;
+    fs::create_directories(disk_dir, ec);
+    if (ec) {
+        LLAMA_LOG_INFO(" - disk dump: cannot create %s: %s\n", disk_dir.c_str(), ec.message().c_str());
+        return false;
+    }
+
+    // Zero-padded counter so filenames sort lexicographically by insertion
+    // order (matches mtime order and makes bootstrap counter-parsing trivial).
+    char fname_buf[40];
+    std::snprintf(fname_buf, sizeof(fname_buf), "prompt-%016llx.kv",
+                  (unsigned long long) next_disk_id);
+    const std::string fname     = fname_buf;
+    const std::string fpath     = disk_dir + "/" + fname;
+    const std::string fpath_tmp = fpath + ".tmp";
+
+    const uint32_t token_count = (uint32_t) p.tokens.n_tokens();
+    const uint64_t data_size   = (uint64_t) p.data.size();
+
+    kv_file_header hdr{};
+    std::memcpy(hdr.magic, KV_MAGIC, sizeof(hdr.magic));
+    hdr.version            = KV_VERSION;
+    hdr.save_reason        = 0; // populated when call sites pass a reason (ds4 Phase 1.5 tagging)
+    hdr.token_count        = token_count;
+    hdr.n_kept_prompt      = (uint32_t) p.n_kept_prompt;
+    hdr.n_discarded_prompt = (uint32_t) p.n_discarded_prompt;
+    hdr.data_size          = data_size;
+    hdr.creation_time_us   = (uint64_t) ggml_time_us();
+
+    FILE * f = std::fopen(fpath_tmp.c_str(), "wb");
+    if (f == nullptr) {
+        LLAMA_LOG_INFO(" - disk dump: cannot open %s for write\n", fpath_tmp.c_str());
+        return false;
+    }
+
+    bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1;
+
+    if (ok) {
+        // Serialize llama_token (int32) as uint32 LE. Build a contiguous buffer
+        // to issue one fwrite; safer than relying on llama_token width matching
+        // uint32 on all platforms.
+        std::vector<uint32_t> tok_buf;
+        tok_buf.reserve(token_count);
+        for (uint32_t i = 0; i < token_count; ++i) {
+            tok_buf.push_back((uint32_t) p.tokens[i]);
+        }
+        ok = std::fwrite(tok_buf.data(), sizeof(uint32_t), token_count, f) == token_count;
+    }
+
+    if (ok && data_size > 0) {
+        ok = std::fwrite(p.data.data(), 1, data_size, f) == data_size;
+    }
+
+    std::fclose(f);
+
+    if (!ok) {
+        std::remove(fpath_tmp.c_str());
+        LLAMA_LOG_INFO(" - disk dump: write failed, removed partial %s\n", fpath_tmp.c_str());
+        return false;
+    }
+
+    // Atomic publication (rename within same filesystem is atomic on POSIX).
+    if (std::rename(fpath_tmp.c_str(), fpath.c_str()) != 0) {
+        std::remove(fpath_tmp.c_str());
+        LLAMA_LOG_INFO(" - disk dump: rename %s -> %s failed\n", fpath_tmp.c_str(), fpath.c_str());
+        return false;
+    }
+
+    p.disk_file      = fname;
+    p.data_disk_size = data_size;
+    p.data.clear();
+    p.data.shrink_to_fit();
+
+    ++next_disk_id;
+
+    LLAMA_LOG_INFO(" - disk dump: wrote %s (%u tokens, %.3f MiB, %.2f ms)\n",
+                   fname.c_str(), token_count,
+                   data_size / (1024.0 * 1024.0),
+                   (ggml_time_us() - t_start) / 1000.0);
+    return true;
 }
 
 bool server_prompt_cache::restore_from_disk(server_prompt & p) {
