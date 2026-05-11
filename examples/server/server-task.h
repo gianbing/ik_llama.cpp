@@ -391,6 +391,12 @@ struct server_prompt {
 
     std::list<server_prompt_checkpoint> checkpoints;
 
+    // Disk tier: when non-empty, `data` is on disk at this path (relative to
+    // server_prompt_cache::disk_dir) and `data.empty()` is true. The blob is
+    // loaded back into `data` on demand in server_prompt_cache::load().
+    std::string disk_file;
+    uint64_t    data_disk_size = 0;
+
     size_t size() const;
 
     int n_tokens() const {
@@ -404,7 +410,9 @@ struct server_prompt {
             n_discarded_prompt,
             think_tokens,
             data,
-            checkpoints
+            checkpoints,
+            disk_file,
+            data_disk_size
         };
     }
 
@@ -426,10 +434,14 @@ struct server_prompt {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(llama_context* ctx, int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(llama_context* ctx, int32_t limit_size_mib, size_t limit_tokens,
+                        std::string disk_dir = "", int32_t limit_disk_mib = 0, size_t n_min_disk = 0) {
         this->ctx = ctx;
         this->limit_size = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->disk_dir = std::move(disk_dir);
+        this->limit_disk_bytes = 1024ull * 1024ull * (limit_disk_mib < 0 ? 0 : limit_disk_mib);
+        this->n_min_disk = n_min_disk;
     }
 
     std::list<server_prompt> states;
@@ -440,6 +452,15 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
     llama_context* ctx;
+
+    // Disk tier (empty = disabled). Entries evicted from RAM are demoted to
+    // disk via dump_to_disk(); they remain in `states` with `data` empty and
+    // `disk_file` populated, and are restored on selection in load().
+    std::string disk_dir;
+    size_t      limit_disk_bytes = 0;   // 0 = no limit
+    size_t      n_min_disk = 0;         // skip disk demotion below this many tokens
+    uint64_t    next_disk_id = 0;       // monotonic file-name counter
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -449,4 +470,13 @@ struct server_prompt_cache {
     bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot);
 
     void update();
+
+private:
+    // Disk-tier helpers (no-op when disk_dir is empty).
+    // dump_to_disk:   move p.data -> file, clear p.data, set p.disk_file
+    // restore_from_disk: read p.disk_file into p.data, unlink the file
+    bool dump_to_disk(server_prompt & p);
+    bool restore_from_disk(server_prompt & p);
+    // Apply LRU on disk by mtime when total disk usage exceeds limit_disk_bytes.
+    void enforce_disk_limit();
 };

@@ -524,8 +524,22 @@ void server_context::init() {
             LLAMA_LOG_INFO("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
         }
         LLAMA_LOG_INFO("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+
+        if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib != 0) {
+            LLAMA_LOG_INFO("prompt cache disk tier enabled at %s (limit: %d MiB, n_min: %d)\n",
+                params_base.cache_disk_path.c_str(),
+                params_base.cache_disk_mib,
+                params_base.cache_disk_n_min);
+        }
+
         // only apply ram size limit. No token limit for now.
-        prompt_cache = std::make_unique<server_prompt_cache>(ctx, params_base.cache_ram_mib, 0);
+        prompt_cache = std::make_unique<server_prompt_cache>(
+            ctx,
+            params_base.cache_ram_mib,
+            0,
+            params_base.cache_disk_path,
+            params_base.cache_disk_mib,
+            (size_t) std::max(0, params_base.cache_disk_n_min));
     }
     else {
         LLAMA_LOG_INFO("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");

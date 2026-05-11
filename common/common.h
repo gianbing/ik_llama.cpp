@@ -521,6 +521,12 @@ struct gpt_params {
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram
     float cache_ram_similarity = 0.5f; // similarity of tokens to cached tokens
 
+    // Disk tier for the prompt cache (RAM eviction is demoted to disk
+    // instead of dropped). Empty path = disabled.
+    std::string cache_disk_path;
+    int32_t     cache_disk_mib   = 16384; // -1 = no limit, 0 = disable, N = N MiB
+    int32_t     cache_disk_n_min = 4096;  // min tokens required to write to disk
+
     // batched-bench params
     bool is_pp_shared = false;
 

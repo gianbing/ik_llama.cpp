@@ -1,6 +1,10 @@
 #include "server-task.h"
 #include "server-chat.h"
 
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+
 json result_timings::to_json() const {
     json base = {
         {"prompt_n",               prompt_n},
@@ -1117,6 +1121,16 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
 
     if (it_best != states.end()) {
         LLAMA_LOG_INFO(" - found better prompt with f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
+
+        // Disk tier: if the chosen entry was demoted, page its blob back into
+        // RAM before handing it to llama_state_seq_set_data.
+        if (!it_best->disk_file.empty() && it_best->data.empty()) {
+            if (!restore_from_disk(*it_best)) {
+                LLAMA_LOG_INFO("failed to restore prompt from disk (%s)\n", it_best->disk_file.c_str());
+                return false;
+            }
+        }
+
         const size_t size = it_best->data.size();
         const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
         if (n != size) {
@@ -1198,10 +1212,34 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            auto & victim = states.front();
+
+            // Disk tier: instead of dropping, demote to disk if enabled and
+            // the victim is still RAM-resident and worth saving.
+            const bool demote = !disk_dir.empty()
+                                && victim.disk_file.empty()
+                                && !victim.data.empty()
+                                && (size_t)victim.n_tokens() >= n_min_disk;
+
+            if (demote && dump_to_disk(victim)) {
+                LLAMA_LOG_INFO(" - cache size limit reached, demoting oldest entry to disk (%s, %.3f MiB)\n",
+                    victim.disk_file.c_str(), victim.data_disk_size / (1024.0 * 1024.0));
+                // Move the now-disk-resident entry to the back so newer RAM
+                // entries can be demoted next time without revisiting this one.
+                states.splice(states.end(), states, states.begin());
+                continue;
+            }
+
+            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n",
+                states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
         }
+    }
+
+    // Disk tier LRU (no-op when disk_dir is empty).
+    if (!disk_dir.empty() && limit_disk_bytes > 0) {
+        enforce_disk_limit();
     }
 
     // average size per token
@@ -1217,4 +1255,100 @@ void server_prompt_cache::update() {
         LLAMA_LOG_INFO("   - prompt %p: %7d tokens, %7d discarded, checkpoints: %2zu, %9.3f MiB\n",
             (const void*)&state, state.n_tokens(), state.n_discarded_prompt, state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+// ============================================================================
+// Disk tier (Phase 1 scaffold — stubs only, no I/O logic yet).
+//
+// File layout for <disk_dir>/prompt-NNNNNNNN.kv:
+//   [ kv_file_header (40 B, naturally aligned) ] [ token_count * u32 LE tokens ] [ data blob ]
+//
+// Naming: prompt-<next_disk_id>.kv (monotonic counter, no SHA1).
+// LRU on disk: mtime-based, applied by enforce_disk_limit().
+//
+// Reserved bits in the header allow adding ds4-style save-reason tagging
+// (see PROJECT_CONTEXT.md "Idee da rubare a ds4 — Phase 1.5") without
+// breaking the format.
+// ============================================================================
+
+namespace {
+
+struct kv_file_header {
+    char     magic[4];          // "IKKV"
+    uint8_t  version;           // 1
+    uint8_t  save_reason;       // 0=unknown; reserved for Phase 1.5
+    uint8_t  reserved[2];
+    uint32_t token_count;
+    uint32_t n_kept_prompt;
+    uint32_t n_discarded_prompt;
+    uint64_t data_size;
+    uint64_t creation_time_us;
+};
+static_assert(sizeof(kv_file_header) == 40, "kv_file_header layout changed; update writers/readers");
+
+constexpr char  KV_MAGIC[4] = {'I', 'K', 'K', 'V'};
+constexpr uint8_t KV_VERSION = 1;
+
+} // namespace
+
+bool server_prompt_cache::dump_to_disk(server_prompt & p) {
+    // Guard: refuse to demote states the disk format cannot fully represent.
+    // Otherwise we'd silently lose recurrent-model checkpoints or vision/audio
+    // chunks at restore time. Caller falls back to dropping the entry.
+    if (!p.checkpoints.empty()) {
+        LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt has recurrent checkpoints (unsupported)\n");
+        return false;
+    }
+    if (p.tokens.has_mtmd_data()) {
+        LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt contains multimodal chunks (unsupported)\n");
+        return false;
+    }
+
+    (void)p;
+    // TODO Phase 1.5:
+    //   1. build kv_file_header with token_count, data_size, n_kept_prompt,
+    //      n_discarded_prompt, creation_time = ggml_time_us().
+    //   2. write to <disk_dir>/prompt-<next_disk_id>.kv.tmp
+    //      sequence: header, tokens (u32 LE), p.data bytes.
+    //   3. rename .tmp -> .kv (atomic on btrfs). Sync I/O is intentional for
+    //      Phase 1.5; revisit with a background thread only if latency
+    //      measurements under concurrent load justify the added complexity.
+    //   4. p.disk_file = "prompt-<id>.kv"
+    //      p.data_disk_size = data.size()
+    //      p.data.clear(); p.data.shrink_to_fit();
+    //   5. ++next_disk_id; enforce_disk_limit().
+    return false;
+}
+
+bool server_prompt_cache::restore_from_disk(server_prompt & p) {
+    (void)p;
+    // TODO Phase 1.5:
+    //   1. open <disk_dir>/<p.disk_file>; read+validate header (magic, version,
+    //      consistent token_count vs p.tokens.size()).
+    //   2. skip token block (already in RAM via p.tokens).
+    //   3. p.data.resize(header.data_size); read blob.
+    //   4. unlink the file; clear p.disk_file; reset p.data_disk_size = 0.
+    return false;
+}
+
+void server_prompt_cache::enforce_disk_limit() {
+    // TODO Phase 1.5:
+    //   - scan disk_dir for prompt-*.kv
+    //   - sum file sizes; if > limit_disk_bytes, sort by mtime ascending
+    //     and unlink oldest until under limit
+    //   - drop matching server_prompt entries from `states` (where
+    //     disk_file == unlinked file) so we don't keep stale handles.
+    //
+    // Bootstrap (one-shot, distinct path — TODO: move to dedicated
+    // bootstrap() method called from the ctor):
+    //   - scan disk_dir for prompt-NNNNNNNN.kv
+    //   - parse the trailing integer from every filename
+    //   - next_disk_id = max(seen) + 1   (avoid name collisions at restart)
+    //   - for each file: read header, push a disk-only server_prompt into
+    //     `states` (tokens populated from the file's token block, data
+    //     empty, disk_file = basename). Do NOT load the blob.
+    //
+    // Note: LRU during normal operation runs on `states` in RAM, not on
+    // filesystem mtimes — the disk scan happens only at bootstrap and at
+    // enforce_disk_limit() when we already need to unlink something.
 }
