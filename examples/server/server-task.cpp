@@ -1090,7 +1090,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
     }
     else {
-        prompt_tokens = std::move(prompt.tokens); 
+        prompt_tokens = prompt.tokens.clone(); 
         tokens_new_ex = tokens_new.clone();
     }
     const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
@@ -1107,7 +1107,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
             tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
         }
         else {
-            tokens = std::move(it->tokens);
+            tokens = it->tokens.clone();
         }
         const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
         const float f_keep_cur = float(lcp_cur.first) / tokens.size();
@@ -1394,34 +1394,193 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p) {
 }
 
 bool server_prompt_cache::restore_from_disk(server_prompt & p) {
-    (void)p;
-    // TODO Phase 1.5:
-    //   1. open <disk_dir>/<p.disk_file>; read+validate header (magic, version,
-    //      consistent token_count vs p.tokens.size()).
-    //   2. skip token block (already in RAM via p.tokens).
-    //   3. p.data.resize(header.data_size); read blob.
-    //   4. unlink the file; clear p.disk_file; reset p.data_disk_size = 0.
-    return false;
+    if (disk_dir.empty() || p.disk_file.empty()) {
+        return false;
+    }
+
+    const int64_t t_start = ggml_time_us();
+    const std::string fpath = disk_dir + "/" + p.disk_file;
+
+    FILE * f = std::fopen(fpath.c_str(), "rb");
+    if (f == nullptr) {
+        LLAMA_LOG_INFO(" - disk restore: cannot open %s\n", fpath.c_str());
+        return false;
+    }
+
+    kv_file_header hdr{};
+    if (std::fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        std::fclose(f);
+        LLAMA_LOG_INFO(" - disk restore: failed to read header from %s\n", fpath.c_str());
+        return false;
+    }
+
+    if (std::memcmp(hdr.magic, KV_MAGIC, sizeof(hdr.magic)) != 0 || hdr.version != KV_VERSION) {
+        std::fclose(f);
+        LLAMA_LOG_INFO(" - disk restore: invalid magic/version in %s\n", fpath.c_str());
+        return false;
+    }
+
+    if (hdr.token_count != (uint32_t)p.tokens.n_tokens() || hdr.data_size != p.data_disk_size) {
+        std::fclose(f);
+        LLAMA_LOG_INFO(" - disk restore: token/size mismatch in %s (expected %u/%llu, got %u/%llu)\n", 
+                       fpath.c_str(), (uint32_t)p.tokens.n_tokens(), (unsigned long long)p.data_disk_size, 
+                       hdr.token_count, (unsigned long long)hdr.data_size);
+        return false;
+    }
+
+    if (std::fseek(f, hdr.token_count * sizeof(uint32_t), SEEK_CUR) != 0) {
+        std::fclose(f);
+        LLAMA_LOG_INFO(" - disk restore: failed to seek past tokens in %s\n", fpath.c_str());
+        return false;
+    }
+
+    p.data.resize(hdr.data_size);
+    if (hdr.data_size > 0) {
+        if (std::fread(p.data.data(), 1, hdr.data_size, f) != hdr.data_size) {
+            p.data.clear();
+            std::fclose(f);
+            LLAMA_LOG_INFO(" - disk restore: failed to read blob from %s\n", fpath.c_str());
+            return false;
+        }
+    }
+
+    p.n_kept_prompt      = (int) hdr.n_kept_prompt;
+    p.n_discarded_prompt = (int) hdr.n_discarded_prompt;
+
+    std::fclose(f);
+
+    if (std::remove(fpath.c_str()) != 0) {
+        LLAMA_LOG_INFO(" - disk restore: warning, failed to remove %s\n", fpath.c_str());
+    }
+
+    LLAMA_LOG_INFO(" - disk restore: loaded %s (%u tokens, %.3f MiB, %.2f ms)\n",
+                   p.disk_file.c_str(), hdr.token_count,
+                   hdr.data_size / (1024.0 * 1024.0),
+                   (ggml_time_us() - t_start) / 1000.0);
+
+    p.disk_file.clear();
+    p.data_disk_size = 0;
+
+    return true;
 }
 
 void server_prompt_cache::enforce_disk_limit() {
-    // TODO Phase 1.5:
-    //   - scan disk_dir for prompt-*.kv
-    //   - sum file sizes; if > limit_disk_bytes, sort by mtime ascending
-    //     and unlink oldest until under limit
-    //   - drop matching server_prompt entries from `states` (where
-    //     disk_file == unlinked file) so we don't keep stale handles.
-    //
-    // Bootstrap (one-shot, distinct path — TODO: move to dedicated
-    // bootstrap() method called from the ctor):
-    //   - scan disk_dir for prompt-NNNNNNNN.kv
-    //   - parse the trailing integer from every filename
-    //   - next_disk_id = max(seen) + 1   (avoid name collisions at restart)
-    //   - for each file: read header, push a disk-only server_prompt into
-    //     `states` (tokens populated from the file's token block, data
-    //     empty, disk_file = basename). Do NOT load the blob.
-    //
-    // Note: LRU during normal operation runs on `states` in RAM, not on
-    // filesystem mtimes — the disk scan happens only at bootstrap and at
-    // enforce_disk_limit() when we already need to unlink something.
+    if (disk_dir.empty() || limit_disk_bytes == 0) return;
+
+    uint64_t total_disk_size = 0;
+    for (const auto& p : states) {
+        total_disk_size += p.data_disk_size;
+    }
+
+    if (total_disk_size <= limit_disk_bytes) return;
+
+    // Disk entries are at the back (spliced there on demotion); oldest-demoted
+    // is furthest back, so evict from the back for correct LRU order.
+    auto it = states.end();
+    while (it != states.begin() && total_disk_size > limit_disk_bytes) {
+        --it;
+        if (!it->disk_file.empty()) {
+            std::string fpath = disk_dir + "/" + it->disk_file;
+            if (std::remove(fpath.c_str()) == 0) {
+                LLAMA_LOG_INFO(" - disk lru: unlinked %s (freed %.3f MiB)\n", it->disk_file.c_str(), it->data_disk_size / (1024.0 * 1024.0));
+            } else {
+                LLAMA_LOG_INFO(" - disk lru: warning, failed to unlink %s\n", it->disk_file.c_str());
+            }
+            total_disk_size -= it->data_disk_size;
+            it = states.erase(it);
+        }
+    }
+}
+
+void server_prompt_cache::bootstrap_disk_tier() {
+    if (disk_dir.empty()) return;
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    if (!fs::exists(disk_dir, ec)) {
+        fs::create_directories(disk_dir, ec);
+        return;
+    }
+
+    int count = 0;
+    uint64_t max_id = 0;
+    bool max_id_found = false;
+
+    for (const auto& entry : fs::directory_iterator(disk_dir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        
+        auto path = entry.path();
+        std::string fname = path.filename().string();
+        
+        // Remove left-over tmp files from previous crashes
+        if (path.extension() == ".tmp") {
+            std::remove(path.c_str());
+            LLAMA_LOG_INFO(" - disk bootstrap: removed orphaned partial file %s\n", fname.c_str());
+            continue;
+        }
+
+        if (path.extension() != ".kv") continue;
+
+        // Parse hex id: prompt-0123456789abcdef.kv
+        if (fname.size() == 26 && fname.starts_with("prompt-")) {
+            std::string hex_str = fname.substr(7, 16);
+            try {
+                uint64_t id = std::stoull(hex_str, nullptr, 16);
+                if (!max_id_found || id > max_id) {
+                    max_id = id;
+                    max_id_found = true;
+                }
+            } catch (...) {
+                // Invalid filename format, ignore
+            }
+        }
+
+        // Read header and tokens
+        FILE* f = std::fopen(path.c_str(), "rb");
+        if (!f) continue;
+
+        kv_file_header hdr{};
+        if (std::fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+            std::memcmp(hdr.magic, KV_MAGIC, sizeof(hdr.magic)) != 0 ||
+            hdr.version != KV_VERSION) {
+            std::fclose(f);
+            std::remove(path.c_str());
+            LLAMA_LOG_INFO(" - disk bootstrap: removed corrupted file %s\n", fname.c_str());
+            continue;
+        }
+
+        std::vector<uint32_t> tok_buf(hdr.token_count);
+        if (hdr.token_count > 0 && std::fread(tok_buf.data(), sizeof(uint32_t), hdr.token_count, f) != hdr.token_count) {
+            std::fclose(f);
+            std::remove(path.c_str());
+            LLAMA_LOG_INFO(" - disk bootstrap: removed truncated file %s\n", fname.c_str());
+            continue;
+        }
+        std::fclose(f);
+
+        server_prompt p;
+        std::vector<llama_token> t_vec;
+        t_vec.reserve(hdr.token_count);
+        for (uint32_t t : tok_buf) {
+            t_vec.push_back((llama_token)t);
+        }
+        p.tokens = server_tokens(t_vec, false);
+        p.n_kept_prompt = hdr.n_kept_prompt;
+        p.n_discarded_prompt = hdr.n_discarded_prompt;
+        p.disk_file = fname;
+        p.data_disk_size = hdr.data_size;
+
+        states.push_back(std::move(p));
+        count++;
+    }
+
+    if (max_id_found) {
+        next_disk_id = max_id + 1;
+    }
+
+    if (count > 0) {
+        LLAMA_LOG_INFO(" - disk bootstrap: loaded %d entries from %s (next id: %llu)\n", 
+                       count, disk_dir.c_str(), (unsigned long long)next_disk_id);
+    }
 }

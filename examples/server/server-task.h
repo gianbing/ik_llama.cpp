@@ -442,6 +442,7 @@ struct server_prompt_cache {
         this->disk_dir = std::move(disk_dir);
         this->limit_disk_bytes = 1024ull * 1024ull * (limit_disk_mib < 0 ? 0 : limit_disk_mib);
         this->n_min_disk = n_min_disk;
+        bootstrap_disk_tier();
     }
 
     std::list<server_prompt> states;
@@ -479,4 +480,6 @@ private:
     bool restore_from_disk(server_prompt & p);
     // Apply LRU on disk by mtime when total disk usage exceeds limit_disk_bytes.
     void enforce_disk_limit();
+    // Scan disk_dir at startup to populate initial cache entries and resume counter.
+    void bootstrap_disk_tier();
 };
