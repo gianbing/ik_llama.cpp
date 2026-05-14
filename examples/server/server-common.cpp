@@ -1311,10 +1311,18 @@ void server_tokens::insert(const std::vector<llama_token>& inp_tokens) {
 
 // for compatibility with context shift and prompt truncation
 void server_tokens::resize(size_t size) {
-    //GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    const size_t prev = tokens.size();
+    // Mirror keep_first(): when shrinking an mtmd-bearing prompt, forbid cuts
+    // that land in the middle of a media chunk — find_chunk(size-1) throws if
+    // the boundary token is not a chunk start. Skip on grow (size >= prev) and
+    // on full-clear (size == 0), neither can split a chunk.
+    if (has_mtmd && size < prev && size > 0) {
+        const llama_token last = tokens[size - 1];
+        if (last == LLAMA_TOKEN_NULL) {
+            find_chunk(size - 1);
+        }
+    }
     tokens.resize(size);
-    // Mirror keep_first(): when shrinking, drop media chunks that fell off
-    // the end so map_idx_to_media never holds dangling indices.
     for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ) {
         if (it->first >= size) {
             it = map_idx_to_media.erase(it);

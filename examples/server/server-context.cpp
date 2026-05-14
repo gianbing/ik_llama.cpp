@@ -588,8 +588,16 @@ void server_context::init() {
 }
 
 
+// PRECONDITION: caller must guarantee that no decode is in flight on this
+// slot's sequence. Since Phase 1.5 this function calls llama_kv_cache_seq_rm
+// on the live KV cache to align the saved state to a 2048-token boundary,
+// which would corrupt an active generation past n_aligned. The current call
+// site (release path in update_slots) holds the slot mutex and the slot is
+// already idle when we get here; do not move this call into the hot path
+// without revisiting the trim block below.
 void server_slot::prompt_save(server_prompt_cache& prompt_cache) {
     assert(server_cached_prompt.data.size() == 0);
+    assert(state == SLOT_STATE_IDLE);
 
     // Phase 1.5 Step B: boundary trim + chunk alignment.
     // Align save length down to a 2048-token boundary so prompts that differ
