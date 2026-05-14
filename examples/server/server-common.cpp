@@ -1313,6 +1313,15 @@ void server_tokens::insert(const std::vector<llama_token>& inp_tokens) {
 void server_tokens::resize(size_t size) {
     //GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens.resize(size);
+    // Mirror keep_first(): when shrinking, drop media chunks that fell off
+    // the end so map_idx_to_media never holds dangling indices.
+    for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ) {
+        if (it->first >= size) {
+            it = map_idx_to_media.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 llama_token* server_tokens::data() {

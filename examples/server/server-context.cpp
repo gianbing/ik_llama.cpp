@@ -596,11 +596,24 @@ void server_slot::prompt_save(server_prompt_cache& prompt_cache) {
     // only in the trailing few tokens collide and share the same cache entry
     // (partial-hit restore recomputes the trimmed tail). Trade-off: we lose
     // up to align-1 tokens of cached work in exchange for higher hit rate.
+    //
+    // Two guards on top of the basic alignment:
+    //  - skip trim entirely for multimodal prompts: the trailing tokens may
+    //    sit inside an image chunk and slicing through it would orphan media
+    //    refs in server_cached_prompt.tokens.map_idx_to_media.
+    //  - require n_aligned >= n_min_disk so we never trim a prompt below the
+    //    disk-tier threshold (otherwise the entry could be silently dropped
+    //    by enforce_disk_limit instead of being persisted).
     constexpr int align = 2048;
     const int n_full    = (int) server_cached_prompt.tokens.size();
     const int n_aligned = n_full & ~(align - 1);
+    const int n_min     = std::max<int>(align, (int) prompt_cache.n_min_disk);
 
-    if (n_aligned >= align && n_aligned < n_full) {
+    const bool can_trim = !server_cached_prompt.tokens.has_mtmd_data()
+                       && n_aligned >= n_min
+                       && n_aligned < n_full;
+
+    if (can_trim) {
         // Drop tail [n_aligned, n_full) from the live KV cache so the state
         // extracted below covers exactly n_aligned tokens.
         llama_kv_cache_seq_rm(ctx, id, n_aligned, -1);
