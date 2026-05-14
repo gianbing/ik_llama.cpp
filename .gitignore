@@ -162,3 +162,34 @@ a.out
 a.out.*
 .dev
 .github
+
+# Local working notes (personal, not for upstream)
+/PROJECT_CONTEXT.md
+/STATUS.md
+/TECHNICAL_REFERENCE.md
+/GEMINI_SUGGESTIONS.md
+/BUG_REPORT_DISK_TIER.md
+/new_changes.md
+/external-notes.md
+/performance_analysis_ds4.md
+/phase2_design.md
+
+# Local utility scripts (personal)
+/ask-local.fish
+/ask-local-payload.py
+/configure.sh
+/local-analyst.skill
+/skills/
+
+# Sandbox bind-mounts (Claude Code sessions mount /dev/null over these)
+/.bash_profile
+/.bashrc
+/.zshrc
+/.zprofile
+/.profile
+/.gitconfig
+/.ripgreprc
+/.idea
+/.vscode
+/.claude/
+/.mcp.json
