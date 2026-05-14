@@ -19,7 +19,7 @@ import time
 import urllib.request
 
 SERVER = os.environ.get("LLAMA_SERVER", "http://127.0.0.1:8080")
-DISK_DIR = "/tmp/kv-cache-deepseek"
+DISK_DIR = os.environ.get("LLAMA_DISK_DIR", "/tmp/kv-cache-deepseek")
 N_FILLERS = 6
 N_VARS = 5
 

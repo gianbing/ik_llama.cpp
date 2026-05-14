@@ -148,6 +148,41 @@ non coperta. È esattamente il caso d'uso che Step B doveva sbloccare.
 
 Script: `bench_phase1_5.py`.
 
+## Bench Phase 2 ROI — non-MLA model (Qwen 3.6 35B-A3B, 2026-05-14)
+
+Setup: Qwen3.6-35B-A3B-Uncensored Q4_K_P, KV q4_0 + flash-attn,
+`-ngl 10 --defer-experts`, ctx 8192, `--cache-ram 64`.
+Stesso `bench_phase1_5.py` con env `LLAMA_DISK_DIR=/tmp/kv-cache-qwen`.
+
+Risultato chiave: **1 disk restore osservato, 76 ms per 85 MiB**.
+
+Confronto disk-restore throughput tra modelli:
+
+| modello                       | restore  | size     | MB/ms | note         |
+|-------------------------------|---------:|---------:|------:|--------------|
+| DeepSeek V2 Lite Q4_0 + MLA   |   35 ms  |   22 MiB |  0.6  | Phase 1 base |
+| DSCoder V2 Lite Q8_0 + MLA    |   11 ms  |   34 MiB |  3.1  | bench 1.5    |
+| Qwen3.6 35B-A3B (non-MLA)     |   76 ms  |   85 MiB |  1.1  | questo bench |
+
+Lo state Qwen è 2.5× più grosso (più layer/heads, GQA con V-cache trasposta)
+e impiega ~3× più tempo del Q8_0 caso migliore. La componente CPU di
+de-shuffle ipotizzata in `phase2_design.md` non sembra dominante: il tempo
+scala col MiB, non con un offset costante.
+
+**Verdetto Phase 2:** anche su non-MLA con V-cache trasposta + KV q4_0, il
+restore resta sotto i 100 ms e già 100× più veloce del cold prefill (8500 ms
+qui). Un kernel CUDA custom (Phase 2 originale) salverebbe ~50 ms su un cold
+da 1700-8000 ms — non vale lo sforzo.
+
+**Caso ancora aperto:** KV F16 (4× più dati = ~340 MB per stato). Lì il
+restore potrebbe arrivare a 300-500 ms e meritare ottimizzazione. Non
+testato in questa sessione.
+
+Le variations hot in questo run girano tutte a ~1700 ms perché il prefill
+dei 336 token di delta su un 35B MoE costa caro di per sé — il path
+disk-tier funziona, ma il modello costoso maschera il guadagno relativo
+che si vedeva sul piccolo Q8_0.
+
 ### Commit suggerito
 
 Non ancora committato. File modificati:
