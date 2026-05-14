@@ -601,7 +601,9 @@ void server_slot::prompt_save(server_prompt_cache& prompt_cache) const {
         return;
     }
 
-    llama_state_seq_get_data(ctx, cur->data.data(), cur_size, id, 0);
+    const size_t written = llama_state_seq_get_data(ctx, cur->data.data(), cur_size, id, 0);
+    LLAMA_LOG_INFO(" - get_data returned %zu / %zu bytes (%.1f%%)\n",
+        written, cur_size, cur_size > 0 ? 100.0 * written / cur_size : 0.0);
 }
 
 void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens) {

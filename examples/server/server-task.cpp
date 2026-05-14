@@ -1078,44 +1078,88 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot) {
-    thinking_tokens think_tokens;
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        think_tokens = it->think_tokens;
-        break;
+    if (states.empty()) {
+        return true;
     }
-    server_tokens prompt_tokens;
+
     server_tokens tokens_new_ex;
-    if (think_tokens.exclude) {
-        prompt_tokens = prompt.tokens.get_tokens_exclude_think(ctx, think_tokens);
-        tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
+    thinking_tokens current_think_tokens;
+    bool tokens_new_ex_valid = false;
+
+    server_tokens prompt_tokens_ex;
+    // We don't have think_tokens for 'prompt' (the slot's current content), 
+    // so we'll use the ones from the first state as a reasonable guess if needed,
+    // but actually prompt_tokens_ex is just used for sim_best initialization.
+    {
+        const thinking_tokens baseline_think = states.front().think_tokens;
+        if (baseline_think.exclude) {
+            prompt_tokens_ex = prompt.tokens.get_tokens_exclude_think(ctx, baseline_think);
+            tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, baseline_think);
+            current_think_tokens = baseline_think;
+            tokens_new_ex_valid = true;
+        } else {
+            prompt_tokens_ex = prompt.tokens.clone();
+        }
     }
-    else {
-        prompt_tokens = prompt.tokens.clone(); 
-        tokens_new_ex = tokens_new.clone();
-    }
-    const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
-    float f_keep_best = float(lcp_best.second) / prompt_tokens.size();
-    float sim_best = prompt_tokens.get_tokens_similarity(ctx, tokens_new_ex, prompt.n_kept_prompt, prompt.n_discarded_prompt);
+
+    const auto lcp_best_init = prompt_tokens_ex.get_common_prefix(ctx, tokens_new_ex_valid ? tokens_new_ex : tokens_new);
+    float f_keep_best = prompt_tokens_ex.empty() ? 0.0f : float(lcp_best_init.second) / prompt_tokens_ex.size();
+    float sim_best = prompt_tokens_ex.get_tokens_similarity(ctx, tokens_new_ex_valid ? tokens_new_ex : tokens_new, prompt.n_kept_prompt, prompt.n_discarded_prompt);
+
     LLAMA_LOG_INFO(" - looking for better prompt, base f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, prompt.n_kept_prompt, prompt.n_discarded_prompt);
 
     auto it_best = states.end();
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        // Quick check for perfect exact match
+        const size_t n_exact = it->tokens.get_common_prefix_exact(tokens_new);
+        if (n_exact == it->tokens.size() && n_exact == tokens_new.size()) {
+            it_best = it;
+            sim_best = 1.0f;
+            f_keep_best = 1.0f;
+            break;
+        }
+
+        // Update tokens_new_ex if this entry has different think_tokens
+        const bool think_changed = it->think_tokens.begin != current_think_tokens.begin
+                                   || it->think_tokens.end   != current_think_tokens.end;
+        if (it->think_tokens.exclude && (!tokens_new_ex_valid || think_changed)) {
+            tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, it->think_tokens);
+            current_think_tokens = it->think_tokens;
+            tokens_new_ex_valid = true;
+        } else if (!it->think_tokens.exclude) {
+            tokens_new_ex_valid = false;
+        }
+
+        const server_tokens& target_tokens_new = tokens_new_ex_valid ? tokens_new_ex : tokens_new;
+
         server_tokens tokens;
-        if (think_tokens.exclude) {
-            tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
+        if (it->think_tokens.exclude) {
+            tokens = it->tokens.get_tokens_exclude_think(ctx, it->think_tokens);
         }
         else {
             tokens = it->tokens.clone();
         }
-        const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
-        const float f_keep_cur = float(lcp_cur.first) / tokens.size();
-        const float sim_cur = tokens.get_tokens_similarity(ctx, tokens_new_ex, it->n_kept_prompt, it->n_discarded_prompt);
+
+        const auto lcp_cur = tokens.get_common_prefix(ctx, target_tokens_new);
+        const float f_keep_cur = tokens.empty() ? 0.0f : float(lcp_cur.first) / tokens.size();
+        
+        float sim_cur = 0.0f;
+        if (it->n_kept_prompt == 0 && it->n_discarded_prompt == 0) {
+            sim_cur = get_slot_similarity(lcp_cur.second, target_tokens_new.size(), tokens.size());
+        } else {
+            sim_cur = tokens.get_tokens_similarity(ctx, target_tokens_new, it->n_kept_prompt, it->n_discarded_prompt);
+        }
+
         if (sim_best < sim_cur) {
             f_keep_best = f_keep_cur;
             sim_best = sim_cur;
             it_best = it;
+            
+            if (sim_best >= 1.0f) {
+                break;
+            }
         }
     }
 
@@ -1133,6 +1177,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
 
         const size_t size = it_best->data.size();
         const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
+        LLAMA_LOG_INFO(" - set_data restored %zu / %zu bytes\n", n, size);
         if (n != size) {
             LLAMA_LOG_INFO("failed to restore state with size %zu\n", size);
             return false;
@@ -1150,13 +1195,23 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
 }
 
 server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t state_size) {
+    auto tokens_ctx_shift = prompt.tokens.clone();  // copy cache tokens
+    tokens_ctx_shift.discard_n_tokens(prompt.n_kept_prompt, prompt.n_discarded_prompt);
+
     for (auto it = states.begin(); it != states.end();) {
-        auto tokens_ctx_shift = prompt.tokens.clone();  // copy cache tokens
-        tokens_ctx_shift.discard_n_tokens(prompt.n_kept_prompt, prompt.n_discarded_prompt);
-        auto prefix = it->tokens.get_common_prefix(ctx, tokens_ctx_shift);
+        // first check if the current state is contained fully in the cache
+        // Use exact matching first to skip expensive fuzzy matching
+        const size_t n_exact = it->tokens.get_common_prefix_exact(tokens_ctx_shift);
+
+        if (n_exact == tokens_ctx_shift.size()) {
+            LLAMA_LOG_INFO("%s", " - prompt is already in the cache, skipping\n");
+            return nullptr;
+        }
+
+        const auto prefix = it->tokens.get_common_prefix(ctx, tokens_ctx_shift);
         const size_t len = prefix.first;
         const size_t len_prompt = prefix.second;
-        // first check if the current state is contained fully in the cache
+
         if (len_prompt == tokens_ctx_shift.size()) {
             LLAMA_LOG_INFO("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
@@ -1212,7 +1267,18 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            auto & victim = states.front();
+            // Disk-resident entries have size()=0 so they never cause the
+            // size limit to be exceeded.  Skip them to find the oldest
+            // RAM-resident entry that is actually consuming memory.
+            auto victim_it = states.begin();
+            while (victim_it != states.end() && !victim_it->disk_file.empty()) {
+                ++victim_it;
+            }
+            if (victim_it == states.end()) {
+                break; // all entries are on disk; nothing to free
+            }
+
+            auto & victim = *victim_it;
 
             // Disk tier: instead of dropping, demote to disk if enabled and
             // the victim is still RAM-resident and worth saving.
@@ -1222,18 +1288,18 @@ void server_prompt_cache::update() {
                                 && (size_t)victim.n_tokens() >= n_min_disk;
 
             if (demote && dump_to_disk(victim)) {
-                LLAMA_LOG_INFO(" - cache size limit reached, demoting oldest entry to disk (%s, %.3f MiB)\n",
+                LLAMA_LOG_INFO(" - cache size limit reached, demoting entry to disk (%s, %.3f MiB)\n",
                     victim.disk_file.c_str(), victim.data_disk_size / (1024.0 * 1024.0));
                 // Move the now-disk-resident entry to the back so newer RAM
                 // entries can be demoted next time without revisiting this one.
-                states.splice(states.end(), states, states.begin());
+                states.splice(states.end(), states, victim_it);
                 continue;
             }
 
-            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n",
-                states.front().size() / (1024.0 * 1024.0));
+            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest RAM entry (size = %.3f MiB)\n",
+                victim.size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            states.erase(victim_it);
         }
     }
 
@@ -1260,8 +1326,9 @@ void server_prompt_cache::update() {
 // ============================================================================
 // Disk tier (Phase 1 scaffold — stubs only, no I/O logic yet).
 //
-// File layout for <disk_dir>/prompt-NNNNNNNN.kv:
-//   [ kv_file_header (40 B, naturally aligned) ] [ token_count * u32 LE tokens ] [ data blob ]
+// File layout for <disk_dir>/prompt-NNNNNNNN.kv (v2):
+//   [ kv_file_header (40 B) ] [ token_count * u32 LE tokens ] [ data blob ]
+//   [ kv_checkpoint_record (32 B) ] [ checkpoint blob ] × checkpoint_count
 //
 // Naming: prompt-<next_disk_id>.kv (monotonic counter, no SHA1).
 // LRU on disk: mtime-based, applied by enforce_disk_limit().
@@ -1275,9 +1342,10 @@ namespace {
 
 struct kv_file_header {
     char     magic[4];          // "IKKV"
-    uint8_t  version;           // 1
+    uint8_t  version;           // format version (current: 2)
     uint8_t  save_reason;       // 0=unknown; reserved for Phase 1.5
-    uint8_t  reserved[2];
+    uint8_t  checkpoint_count;  // v2+: number of checkpoint records after the data blob
+    uint8_t  reserved;          // must be zero
     uint32_t token_count;
     uint32_t n_kept_prompt;
     uint32_t n_discarded_prompt;
@@ -1286,19 +1354,24 @@ struct kv_file_header {
 };
 static_assert(sizeof(kv_file_header) == 40, "kv_file_header layout changed; update writers/readers");
 
-constexpr char  KV_MAGIC[4] = {'I', 'K', 'K', 'V'};
-constexpr uint8_t KV_VERSION = 1;
+// Each checkpoint record is written after the main data blob (v2+).
+// Followed immediately by `data_size` bytes of raw checkpoint blob.
+struct kv_checkpoint_record {
+    int32_t  pos_min;
+    int32_t  pos_max;
+    int32_t  pos_min_prompt;
+    int32_t  pos_max_prompt;
+    int64_t  n_tokens;
+    uint64_t data_size;
+};
+static_assert(sizeof(kv_checkpoint_record) == 32, "kv_checkpoint_record layout changed; update writers/readers");
+
+constexpr char    KV_MAGIC[4] = {'I', 'K', 'K', 'V'};
+constexpr uint8_t KV_VERSION  = 2;
 
 } // namespace
 
 bool server_prompt_cache::dump_to_disk(server_prompt & p) {
-    // Guard: refuse to demote states the disk format cannot fully represent.
-    // Otherwise we'd silently lose recurrent-model checkpoints or vision/audio
-    // chunks at restore time. Caller falls back to dropping the entry.
-    if (!p.checkpoints.empty()) {
-        LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt has recurrent checkpoints (unsupported)\n");
-        return false;
-    }
     if (p.tokens.has_mtmd_data()) {
         LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt contains multimodal chunks (unsupported)\n");
         return false;
@@ -1327,13 +1400,15 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p) {
     const std::string fpath     = disk_dir + "/" + fname;
     const std::string fpath_tmp = fpath + ".tmp";
 
-    const uint32_t token_count = (uint32_t) p.tokens.n_tokens();
-    const uint64_t data_size   = (uint64_t) p.data.size();
+    const uint32_t token_count  = (uint32_t) p.tokens.n_tokens();
+    const uint64_t data_size    = (uint64_t) p.data.size();
+    const uint8_t  chkpt_count  = (uint8_t) std::min(p.checkpoints.size(), (size_t) 255);
 
     kv_file_header hdr{};
     std::memcpy(hdr.magic, KV_MAGIC, sizeof(hdr.magic));
     hdr.version            = KV_VERSION;
     hdr.save_reason        = 0; // populated when call sites pass a reason (ds4 Phase 1.5 tagging)
+    hdr.checkpoint_count   = chkpt_count;
     hdr.token_count        = token_count;
     hdr.n_kept_prompt      = (uint32_t) p.n_kept_prompt;
     hdr.n_discarded_prompt = (uint32_t) p.n_discarded_prompt;
@@ -1364,6 +1439,26 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p) {
         ok = std::fwrite(p.data.data(), 1, data_size, f) == data_size;
     }
 
+    // Serialize checkpoints (v2): fixed-size record followed by blob.
+    if (ok) {
+        size_t written = 0;
+        for (const auto & chk : p.checkpoints) {
+            if (written++ >= chkpt_count) break;
+            kv_checkpoint_record rec{};
+            rec.pos_min        = chk.pos_min;
+            rec.pos_max        = chk.pos_max;
+            rec.pos_min_prompt = chk.pos_min_prompt;
+            rec.pos_max_prompt = chk.pos_max_prompt;
+            rec.n_tokens       = chk.n_tokens;
+            rec.data_size      = (uint64_t) chk.data.size();
+            ok = std::fwrite(&rec, sizeof(rec), 1, f) == 1;
+            if (ok && rec.data_size > 0) {
+                ok = std::fwrite(chk.data.data(), 1, rec.data_size, f) == rec.data_size;
+            }
+            if (!ok) break;
+        }
+    }
+
     std::fclose(f);
 
     if (!ok) {
@@ -1383,11 +1478,12 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p) {
     p.data_disk_size = data_size;
     p.data.clear();
     p.data.shrink_to_fit();
+    p.checkpoints.clear();
 
     ++next_disk_id;
 
-    LLAMA_LOG_INFO(" - disk dump: wrote %s (%u tokens, %.3f MiB, %.2f ms)\n",
-                   fname.c_str(), token_count,
+    LLAMA_LOG_INFO(" - disk dump: wrote %s (%u tokens, %u checkpoints, %.3f MiB, %.2f ms)\n",
+                   fname.c_str(), token_count, (unsigned) chkpt_count,
                    data_size / (1024.0 * 1024.0),
                    (ggml_time_us() - t_start) / 1000.0);
     return true;
@@ -1444,6 +1540,36 @@ bool server_prompt_cache::restore_from_disk(server_prompt & p) {
         }
     }
 
+    // Deserialize checkpoints (v2).
+    p.checkpoints.clear();
+    for (uint8_t i = 0; i < hdr.checkpoint_count; ++i) {
+        kv_checkpoint_record rec{};
+        if (std::fread(&rec, sizeof(rec), 1, f) != 1) {
+            p.data.clear();
+            p.checkpoints.clear();
+            std::fclose(f);
+            LLAMA_LOG_INFO(" - disk restore: failed to read checkpoint record %u from %s\n", (unsigned)i, fpath.c_str());
+            return false;
+        }
+        server_prompt_checkpoint chk{};
+        chk.pos_min        = rec.pos_min;
+        chk.pos_max        = rec.pos_max;
+        chk.pos_min_prompt = rec.pos_min_prompt;
+        chk.pos_max_prompt = rec.pos_max_prompt;
+        chk.n_tokens       = rec.n_tokens;
+        if (rec.data_size > 0) {
+            chk.data.resize(rec.data_size);
+            if (std::fread(chk.data.data(), 1, rec.data_size, f) != rec.data_size) {
+                p.data.clear();
+                p.checkpoints.clear();
+                std::fclose(f);
+                LLAMA_LOG_INFO(" - disk restore: failed to read checkpoint data %u from %s\n", (unsigned)i, fpath.c_str());
+                return false;
+            }
+        }
+        p.checkpoints.push_back(std::move(chk));
+    }
+
     p.n_kept_prompt      = (int) hdr.n_kept_prompt;
     p.n_discarded_prompt = (int) hdr.n_discarded_prompt;
 
@@ -1453,8 +1579,8 @@ bool server_prompt_cache::restore_from_disk(server_prompt & p) {
         LLAMA_LOG_INFO(" - disk restore: warning, failed to remove %s\n", fpath.c_str());
     }
 
-    LLAMA_LOG_INFO(" - disk restore: loaded %s (%u tokens, %.3f MiB, %.2f ms)\n",
-                   p.disk_file.c_str(), hdr.token_count,
+    LLAMA_LOG_INFO(" - disk restore: loaded %s (%u tokens, %u checkpoints, %.3f MiB, %.2f ms)\n",
+                   p.disk_file.c_str(), hdr.token_count, (unsigned) hdr.checkpoint_count,
                    hdr.data_size / (1024.0 * 1024.0),
                    (ggml_time_us() - t_start) / 1000.0);
 
@@ -1474,11 +1600,11 @@ void server_prompt_cache::enforce_disk_limit() {
 
     if (total_disk_size <= limit_disk_bytes) return;
 
-    // Disk entries are at the back (spliced there on demotion); oldest-demoted
-    // is furthest back, so evict from the back for correct LRU order.
-    auto it = states.end();
-    while (it != states.begin() && total_disk_size > limit_disk_bytes) {
-        --it;
+    // Disk entries sit after RAM entries in the list (spliced to end on demotion).
+    // Within the disk segment the oldest-demoted entry is first, so iterate
+    // forward and evict in order to get correct LRU behaviour.
+    auto it = states.begin();
+    while (it != states.end() && total_disk_size > limit_disk_bytes) {
         if (!it->disk_file.empty()) {
             std::string fpath = disk_dir + "/" + it->disk_file;
             if (std::remove(fpath.c_str()) == 0) {
@@ -1488,6 +1614,8 @@ void server_prompt_cache::enforce_disk_limit() {
             }
             total_disk_size -= it->data_disk_size;
             it = states.erase(it);
+        } else {
+            ++it;
         }
     }
 }
