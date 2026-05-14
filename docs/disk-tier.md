@@ -115,19 +115,13 @@ Per-restore overhead is dominated by I/O at this state size (~3 MiB/ms for
 the MLA case, ~1 MiB/ms on a 35B non-MLA model). See the trim-fires log
 output to validate that boundary alignment is engaging.
 
-### Non-MLA: Phase 2 ROI check
+### Non-MLA spot check
 
-Tested on Qwen 3.6 35B-A3B (non-MLA, GQA, V-cache transposed), KV `q4_0`,
-flash-attn on, same workload: single observed disk restore took **76 ms /
-85 MiB**, scaling with state size, not with a constant CPU offset.
-
-The original Phase 2 design proposed a raw CUDA copy path to bypass
-`llama_state_seq_set_data`'s de-shuffle, assuming the de-shuffle was the
-bottleneck on non-MLA models. The measurement does not support that
-assumption: even on non-MLA the restore stays under 100 ms, two orders of
-magnitude below cold prefill, so a CUDA-copy kernel would save at most a
-handful of milliseconds in absolute terms. Open case: KV F16 (~4&times;
-state size) was not measured and might still warrant the optimization.
+Qwen 3.6 35B-A3B (non-MLA, GQA, V-cache transposed), KV `q4_0`,
+flash-attn on, same workload: single observed disk restore took **76 ms
+for an 85 MiB state**, i.e. ~1 MiB/ms &mdash; same order of magnitude as
+the MLA cases above, two orders of magnitude faster than cold prefill on
+that model.
 
 ## Reproducing the benchmarks
 
