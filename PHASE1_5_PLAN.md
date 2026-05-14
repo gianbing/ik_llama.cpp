@@ -121,7 +121,32 @@ Demotion dopo 2 entry da ~34 MiB (4096 tok) → `/tmp/kv-cache-deepseek/prompt-0
 - CLI flag `--cache-disk-align N` / `--cache-disk-trim N` (hardcoded `align=2048`; il trim "−32 tail" è stato omesso perché produceva regressioni sui prompt esattamente allineati).
 - Benchmark prima/dopo (`benchmark_disk_cache.sh`) — il bench dimostrerebbe l'incremento di hit-rate su prompt di lunghezza simile ma non identica.
 
-**TODO benchmark:** confrontare hit rate / TTFT su una traccia di N prompt sintetici dove ogni replica varia solo gli ultimi 1-100 token rispetto a un baseline a 4128 tok. Con Step B, tutti dovrebbero collidere su un entry a 4096 tok; senza Step B sarebbero N entry distinte.
+**Benchmark partial-hit (2026-05-14, post-review fixes — commit `25c221e`):**
+
+Workload: P0 baseline (~4426 tok) + 6 filler diversi (~2224 tok ciascuno) per
+forzare RAM-eviction, poi 5 variations con stesso prefisso e coda diversa.
+Modello: DeepSeek Coder V2 Lite Q8_0, KV q4_0 + flash-attn, --cache-ram 64,
+--cache-disk-mib 20480, --cache-disk-n-min 100.
+
+| step          | prompt_n | prompt_ms | note                              |
+|---------------|---------:|----------:|-----------------------------------|
+| P0 cold       |     4426 |    7424.1 | slot vuoto, disk vuoto            |
+| filler avg    |    ~2200 |     ~3590 | cold (prompt nuovo ogni volta)    |
+| Pv1 (1° hot)  |      334 |     752.6 | partial-hit disk: 4092 tok da .kv |
+| Pv2 (RAM hit) |        7 |     126.1 | slot ha P0_trimmed in RAM         |
+| Pv3 (RAM hit) |        7 |     122.1 |                                   |
+| Pv4 (RAM hit) |        7 |     118.6 |                                   |
+| Pv5 (RAM hit) |        7 |     145.8 |                                   |
+
+Server log conferma 7 trim su save (P0 4426→4096; ogni filler 2224→2048) e
+`disk restore: ... 4096 tokens, save_reason=evict, 11.07 ms` su Pv1.
+Speedup vs cold: 9.9× (disk partial-hit) → 57× (RAM partial-hit).
+
+Lo speedup grezzo (132× del Phase 1) era misurato su match esatto di tutto il
+prompt; qui ogni variation ha coda diversa quindi paga il prefill della parte
+non coperta. È esattamente il caso d'uso che Step B doveva sbloccare.
+
+Script: `bench_phase1_5.py`.
 
 ### Commit suggerito
 
