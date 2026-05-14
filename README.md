@@ -6,6 +6,9 @@
 
 This repository is a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) with better CPU and hybrid GPU/CPU performance, new SOTA quantization types, first-class Bitnet support, better DeepSeek performance via MLA, FlashMLA, fused MoE operations and tensor overrides for hybrid GPU/CPU inference, row-interleaved quant packing, etc.
 
+>[!NOTE]
+>**This fork** (`gianbing/ik_llama.cpp`) adds an NVMe-backed disk tier to the server's prompt cache: KV states evicted from RAM are written to disk and restored on resume instead of being cold-prefilled. See [`docs/disk-tier.md`](docs/disk-tier.md) for the flags, file format, and benchmarks (up to 132&times; faster than cold prefill on full hits).
+
 >[!IMPORTANT]
 >If you are running hybrid CPU/GPU inference for MoE models with all or some experts left on the CPU, **do not use -rtr** unless you know what you are doing. The `-rtr` option causes all tensors left in RAM to be repacked to row-interleaved format while loading the model. As not all quantization types have a CUDA implementation, this will result in matrix multiplications with these tensors to be **always done on the CPU**, even when it would have been much better to offload the computation to the GPU, typically resulting in much lower prompt processing speed. Most notably, k-quants (`K2_K, Q3_K, Q4_K, Q5_K, Q6_K`) do not have CUDA row-interleaved implementation.
 
