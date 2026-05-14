@@ -588,8 +588,38 @@ void server_context::init() {
 }
 
 
-void server_slot::prompt_save(server_prompt_cache& prompt_cache) const {
+void server_slot::prompt_save(server_prompt_cache& prompt_cache) {
     assert(server_cached_prompt.data.size() == 0);
+
+    // Phase 1.5 Step B: boundary trim + chunk alignment.
+    // Align save length down to a 2048-token boundary so prompts that differ
+    // only in the trailing few tokens collide and share the same cache entry
+    // (partial-hit restore recomputes the trimmed tail). Trade-off: we lose
+    // up to align-1 tokens of cached work in exchange for higher hit rate.
+    constexpr int align = 2048;
+    const int n_full    = (int) server_cached_prompt.tokens.size();
+    const int n_aligned = n_full & ~(align - 1);
+
+    if (n_aligned >= align && n_aligned < n_full) {
+        // Drop tail [n_aligned, n_full) from the live KV cache so the state
+        // extracted below covers exactly n_aligned tokens.
+        llama_kv_cache_seq_rm(ctx, id, n_aligned, -1);
+
+        // Keep slot bookkeeping in sync with the new KV reality.
+        cache_tokens.resize(n_aligned);
+        server_cached_prompt.tokens.resize(n_aligned);
+
+        // Discard checkpoints that extend past the trimmed range.
+        // pos_max is the inclusive last-position index, so a checkpoint
+        // covering positions [0, n_aligned-1] (== n_aligned tokens) is kept.
+        server_cached_prompt.checkpoints.remove_if(
+            [n_aligned](const server_prompt_checkpoint & c) {
+                return c.pos_max >= n_aligned;
+            });
+
+        LLAMA_LOG_INFO(" - boundary trim: %d -> %d tokens (align=%d)\n",
+                       n_full, n_aligned, align);
+    }
 
     const size_t cur_size = llama_state_seq_get_size(ctx, id, 0);
 

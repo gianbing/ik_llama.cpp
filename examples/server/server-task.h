@@ -472,11 +472,22 @@ struct server_prompt_cache {
 
     void update();
 
+    // Why an entry was demoted to disk (ds4 Phase 1.5 save-reason tagging).
+    // Stored in kv_file_header.save_reason; informational, surfaced in logs
+    // and reserved for future restore/eviction policy.
+    enum class disk_save_reason : uint8_t {
+        unknown   = 0,
+        cold      = 1, // entry hadn't been touched for a while
+        continued = 2, // re-save of an already-on-disk entry (not used yet)
+        evict     = 3, // demoted because RAM tier was full (common path)
+        shutdown  = 4, // flushed at server exit
+    };
+
 private:
     // Disk-tier helpers (no-op when disk_dir is empty).
     // dump_to_disk:   move p.data -> file, clear p.data, set p.disk_file
     // restore_from_disk: read p.disk_file into p.data, unlink the file
-    bool dump_to_disk(server_prompt & p);
+    bool dump_to_disk(server_prompt & p, disk_save_reason reason = disk_save_reason::unknown);
     bool restore_from_disk(server_prompt & p);
     // Apply LRU on disk by mtime when total disk usage exceeds limit_disk_bytes.
     void enforce_disk_limit();

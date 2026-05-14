@@ -1287,7 +1287,7 @@ void server_prompt_cache::update() {
                                 && !victim.data.empty()
                                 && (size_t)victim.n_tokens() >= n_min_disk;
 
-            if (demote && dump_to_disk(victim)) {
+            if (demote && dump_to_disk(victim, disk_save_reason::evict)) {
                 LLAMA_LOG_INFO(" - cache size limit reached, demoting entry to disk (%s, %.3f MiB)\n",
                     victim.disk_file.c_str(), victim.data_disk_size / (1024.0 * 1024.0));
                 // Move the now-disk-resident entry to the back so newer RAM
@@ -1371,7 +1371,7 @@ constexpr uint8_t KV_VERSION  = 2;
 
 } // namespace
 
-bool server_prompt_cache::dump_to_disk(server_prompt & p) {
+bool server_prompt_cache::dump_to_disk(server_prompt & p, disk_save_reason reason) {
     if (p.tokens.has_mtmd_data()) {
         LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt contains multimodal chunks (unsupported)\n");
         return false;
@@ -1407,7 +1407,7 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p) {
     kv_file_header hdr{};
     std::memcpy(hdr.magic, KV_MAGIC, sizeof(hdr.magic));
     hdr.version            = KV_VERSION;
-    hdr.save_reason        = 0; // populated when call sites pass a reason (ds4 Phase 1.5 tagging)
+    hdr.save_reason        = (uint8_t) reason;
     hdr.checkpoint_count   = chkpt_count;
     hdr.token_count        = token_count;
     hdr.n_kept_prompt      = (uint32_t) p.n_kept_prompt;
@@ -1579,9 +1579,17 @@ bool server_prompt_cache::restore_from_disk(server_prompt & p) {
         LLAMA_LOG_INFO(" - disk restore: warning, failed to remove %s\n", fpath.c_str());
     }
 
-    LLAMA_LOG_INFO(" - disk restore: loaded %s (%u tokens, %u checkpoints, %.3f MiB, %.2f ms)\n",
+    const char * reason_str = "unknown";
+    switch (hdr.save_reason) {
+        case 1: reason_str = "cold";      break;
+        case 2: reason_str = "continued"; break;
+        case 3: reason_str = "evict";     break;
+        case 4: reason_str = "shutdown";  break;
+        default: break;
+    }
+    LLAMA_LOG_INFO(" - disk restore: loaded %s (%u tokens, %u checkpoints, %.3f MiB, save_reason=%s, %.2f ms)\n",
                    p.disk_file.c_str(), hdr.token_count, (unsigned) hdr.checkpoint_count,
-                   hdr.data_size / (1024.0 * 1024.0),
+                   hdr.data_size / (1024.0 * 1024.0), reason_str,
                    (ggml_time_us() - t_start) / 1000.0);
 
     p.disk_file.clear();

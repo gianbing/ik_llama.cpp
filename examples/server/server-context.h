@@ -125,7 +125,7 @@ struct server_slot {
 
     server_prompt server_cached_prompt;
 
-    void prompt_save(server_prompt_cache& prompt_cache) const;
+    void prompt_save(server_prompt_cache& prompt_cache);
 
     void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens);
 
