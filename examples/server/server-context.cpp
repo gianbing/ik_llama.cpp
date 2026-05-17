@@ -655,6 +655,10 @@ void server_slot::prompt_save(server_prompt_cache& prompt_cache) {
     const size_t written = llama_state_seq_get_data(ctx, cur->data.data(), cur_size, id, 0);
     LLAMA_LOG_INFO(" - get_data returned %zu / %zu bytes (%.1f%%)\n",
         written, cur_size, cur_size > 0 ? 100.0 * written / cur_size : 0.0);
+
+    // A clean prompt save supersedes any live checkpoint for this slot. Unlink
+    // the slot-<id>.kv file so bootstrap won't surface a stale snapshot.
+    prompt_cache.drop_live_checkpoint(id);
 }
 
 void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens) {
@@ -662,6 +666,41 @@ void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_to
     if (!res) {
         LLAMA_LOG_INFO("failed to load prompt from cache\n");
     }
+}
+
+void server_slot::live_checkpoint(server_prompt_cache & prompt_cache) {
+    // Cheap guards before paying for the (sync) state extraction.
+    if (cache_tokens.has_mtmd_data()) return;
+    if (cache_tokens.n_tokens() <= 0) return;
+    if ((size_t) cache_tokens.n_tokens() < prompt_cache.n_min_disk) return;
+
+    const size_t state_size = llama_state_seq_get_size(ctx, id, 0);
+    if (state_size == 0) return;
+
+    std::vector<uint8_t> blob;
+    try {
+        blob.resize(state_size);
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_INFO(" - live checkpoint: bad_alloc for %zu bytes, skip\n", state_size);
+        return;
+    }
+
+    const size_t written = llama_state_seq_get_data(ctx, blob.data(), state_size, id, 0);
+    if (written != state_size) {
+        LLAMA_LOG_INFO(" - live checkpoint: get_data wrote %zu/%zu, skip\n", written, state_size);
+        return;
+    }
+
+    // Snapshot constructed locally; not inserted into prompt_cache.states.
+    server_prompt snap;
+    snap.tokens             = cache_tokens.clone();
+    snap.n_kept_prompt      = n_kept_prompt;
+    snap.n_discarded_prompt = n_discarded_prompt;
+    snap.think_tokens       = server_cached_prompt.think_tokens;
+    snap.data               = std::move(blob);
+    snap.checkpoints        = server_cached_prompt.checkpoints;
+
+    prompt_cache.live_checkpoint(id, snap);
 }
 
 void server_slot::reset() {
@@ -3505,6 +3544,18 @@ void server_context::context_shift_prompt(llama_context* ctx, server_slot& slot,
     slot.n_prompt_tokens = slot.prompt_tokens.size();
 }
 
+void server_context::maybe_live_checkpoint(server_slot & slot) {
+    // Persist current KV every LIVE_CKPT_INTERVAL generated tokens so a crash
+    // mid-generation can recover most of the work. Called from both the main
+    // decode path and the speculative-accept path. Sync I/O — known MVP limit
+    // for very large KV blobs.
+    constexpr int32_t LIVE_CKPT_INTERVAL = 256;
+    if (!prompt_cache) return;
+    if (slot.n_decoded - slot.n_decoded_last_ckpt < LIVE_CKPT_INTERVAL) return;
+    slot.live_checkpoint(*prompt_cache);
+    slot.n_decoded_last_ckpt = slot.n_decoded;
+}
+
 void server_context::release_slots()
 {
     for (auto& slot : slots) {
@@ -4155,6 +4206,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     batch.logits[batch.n_tokens - 1] = true;
 
                     slot.n_decoded = 0;
+                    slot.n_decoded_last_ckpt = 0;
                     slot.i_batch = batch.n_tokens - 1;
 
                     LOG_VERBOSE("prompt done", {
@@ -4365,6 +4417,8 @@ void server_context::speculative_decoding_accept() {
         slot.n_decoded += ids.size();
         const int64_t t_current = ggml_time_us();
         slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+        maybe_live_checkpoint(slot);
 
         // update how many tokens out of those tested were accepted
         slot.n_draft_accepted += ids.size() - 1;
@@ -4866,6 +4920,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             }
 
             slot.n_decoded += 1;
+            maybe_live_checkpoint(slot);
             const int64_t t_current = ggml_time_us();
 
             if (slot.n_decoded == 1) {

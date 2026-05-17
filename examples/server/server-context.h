@@ -58,6 +58,7 @@ struct server_slot {
     int32_t n_past_prompt = 0;
     int32_t n_past_offset = 0;
     int32_t n_decoded = 0;
+    int32_t n_decoded_last_ckpt = 0;
     int32_t n_remaining = -1;
     int32_t n_discarded_prompt = 0;
     int32_t n_kept_prompt = 0;
@@ -126,6 +127,11 @@ struct server_slot {
     server_prompt server_cached_prompt;
 
     void prompt_save(server_prompt_cache& prompt_cache);
+
+    // Live checkpoint: snapshot the current KV state and persist to disk while
+    // the slot keeps generating. No mutation to slot state; called periodically
+    // from update_slots(). No-op when disk tier is disabled or prompt is mtmd.
+    void live_checkpoint(server_prompt_cache& prompt_cache);
 
     void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens);
 
@@ -375,6 +381,11 @@ struct server_context {
     void update_slots();
 
     void release_slots();
+
+    // Live checkpoint trigger: called after each decoded-token bump in both
+    // the main and speculative paths. No-op when prompt_cache is disabled or
+    // the interval has not elapsed yet.
+    void maybe_live_checkpoint(server_slot & slot);
 
     bool slots_idle();
 

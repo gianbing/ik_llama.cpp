@@ -397,6 +397,19 @@ struct server_prompt {
     std::string disk_file;
     uint64_t    data_disk_size = 0;
 
+    // Transient (not persisted in clone()): last header save_reason observed,
+    // either set by dump_to_disk on demotion or by bootstrap_disk_tier/
+    // restore_from_disk after reading the header. 0 = unknown.
+    uint8_t last_reason = 0;
+
+    // Transient: true if this entry was paged back from disk during this
+    // process' lifetime. Drives the choice continued vs evict on re-demotion.
+    bool was_restored_from_disk = false;
+
+    // Transient: monotonic timestamp of last touch (load/alloc). Used by the
+    // cold demoter in update(). 0 means never touched in this process.
+    int64_t last_used_us = 0;
+
     size_t size() const;
 
     int n_tokens() const {
@@ -412,7 +425,10 @@ struct server_prompt {
             data,
             checkpoints,
             disk_file,
-            data_disk_size
+            data_disk_size,
+            last_reason,
+            was_restored_from_disk,
+            last_used_us
         };
     }
 
@@ -473,15 +489,30 @@ struct server_prompt_cache {
     void update();
 
     // Why an entry was demoted to disk (ds4 Phase 1.5 save-reason tagging).
-    // Stored in kv_file_header.save_reason; informational, surfaced in logs
-    // and reserved for future restore/eviction policy.
+    // Stored in kv_file_header.save_reason; surfaced in logs and used by
+    // enforce_disk_limit / bootstrap to drive restore + eviction priority.
     enum class disk_save_reason : uint8_t {
         unknown   = 0,
         cold      = 1, // entry hadn't been touched for a while
-        continued = 2, // re-save of an already-on-disk entry (not used yet)
+        continued = 2, // re-save of an entry that came back from disk this run
         evict     = 3, // demoted because RAM tier was full (common path)
         shutdown  = 4, // flushed at server exit
     };
+
+    // Flush every RAM-resident entry to disk with the given reason. Intended
+    // for clean shutdown (reason=shutdown). No-op when disk tier is disabled.
+    // Returns the number of entries actually demoted.
+    size_t flush_all_to_disk(disk_save_reason reason);
+
+    // Live checkpoint: persist the current state of a still-active slot to
+    // disk so a crash mid-generation can recover most of the work. Writes
+    // `slot-<slot_id>.kv` atomically, overwriting the previous live checkpoint
+    // for the same slot. Does not touch RAM state.
+    bool live_checkpoint(int32_t slot_id, server_prompt & snap);
+
+    // Remove a slot's live checkpoint file. Called from server_slot::prompt_save
+    // once a clean prompt-<id>.kv supersedes the partial one.
+    void drop_live_checkpoint(int32_t slot_id);
 
 private:
     // Disk-tier helpers (no-op when disk_dir is empty).
@@ -493,4 +524,9 @@ private:
     void enforce_disk_limit();
     // Scan disk_dir at startup to populate initial cache entries and resume counter.
     void bootstrap_disk_tier();
+    // Atomic write of a fully-formed entry to <disk_dir>/<fname>. Used by both
+    // dump_to_disk (with prompt-NNN.kv) and live_checkpoint (with slot-N.kv).
+    bool write_kv_file_atomic(const std::string & fname,
+                              const server_prompt & p,
+                              disk_save_reason reason);
 };

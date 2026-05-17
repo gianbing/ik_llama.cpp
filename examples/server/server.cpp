@@ -2168,6 +2168,14 @@ int main(int argc, char ** argv) {
     svr->stop();
     t.join();
 
+    // Disk tier: flush remaining RAM-resident entries with reason=shutdown so
+    // a subsequent restart can preferentially restore them (vs cold/evict).
+    // Safe here: queue is terminated, server stopped, worker joined.
+    if (ctx_server.prompt_cache) {
+        ctx_server.prompt_cache->flush_all_to_disk(
+            server_prompt_cache::disk_save_reason::shutdown);
+    }
+
     llama_backend_free();
 
     return 0;

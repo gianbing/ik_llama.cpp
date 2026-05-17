@@ -1255,6 +1255,14 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
         /*.checkpoints     =*/ prompt.checkpoints,
     };
 
+    // Propagate transient state from the source prompt so that an entry which
+    // came back from disk earlier in this process is still recognized as
+    // "continued" on the next demotion. Touch last_used_us so the cold demoter
+    // gives a freshly stored entry its full idle budget.
+    cur.was_restored_from_disk = prompt.was_restored_from_disk;
+    cur.last_reason            = prompt.last_reason;
+    cur.last_used_us           = ggml_time_us();
+
     return &cur;
 }
 
@@ -1287,7 +1295,11 @@ void server_prompt_cache::update() {
                                 && !victim.data.empty()
                                 && (size_t)victim.n_tokens() >= n_min_disk;
 
-            if (demote && dump_to_disk(victim, disk_save_reason::evict)) {
+            const auto reason = victim.was_restored_from_disk
+                                ? disk_save_reason::continued
+                                : disk_save_reason::evict;
+
+            if (demote && dump_to_disk(victim, reason)) {
                 LLAMA_LOG_INFO(" - cache size limit reached, demoting entry to disk (%s, %.3f MiB)\n",
                     victim.disk_file.c_str(), victim.data_disk_size / (1024.0 * 1024.0));
                 // Move the now-disk-resident entry to the back so newer RAM
@@ -1300,6 +1312,36 @@ void server_prompt_cache::update() {
                 victim.size() / (1024.0 * 1024.0));
 
             states.erase(victim_it);
+        }
+    }
+
+    // Proactive cold demotion: move RAM-resident entries idle for longer than
+    // COLD_THRESHOLD_US to disk even when we are below limit_size. Keeps the
+    // working set in RAM small and amortizes write cost away from the moment
+    // RAM is actually exhausted. last_used_us == 0 means we never observed a
+    // touch (e.g. fresh-from-bootstrap), so we skip those until they are used.
+    if (!disk_dir.empty()) {
+        constexpr int64_t COLD_THRESHOLD_US = 300LL * 1000LL * 1000LL; // 5 min
+        const int64_t now = ggml_time_us();
+
+        for (auto it = states.begin(); it != states.end(); ) {
+            const bool ram_resident = !it->data.empty() && it->disk_file.empty();
+            const bool eligible     = ram_resident
+                                      && it->last_used_us > 0
+                                      && (now - it->last_used_us) > COLD_THRESHOLD_US
+                                      && (size_t) it->n_tokens() >= n_min_disk;
+
+            if (eligible) {
+                auto it_next = std::next(it);
+                if (dump_to_disk(*it, disk_save_reason::cold)) {
+                    LLAMA_LOG_INFO(" - cold demotion: idle %.1f s, moved to disk (%s)\n",
+                        (now - it->last_used_us) / 1e6, it->disk_file.c_str());
+                    states.splice(states.end(), states, it);
+                }
+                it = it_next;
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -1371,38 +1413,25 @@ constexpr uint8_t KV_VERSION  = 2;
 
 } // namespace
 
-bool server_prompt_cache::dump_to_disk(server_prompt & p, disk_save_reason reason) {
-    if (p.tokens.has_mtmd_data()) {
-        LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt contains multimodal chunks (unsupported)\n");
-        return false;
-    }
-    if (disk_dir.empty() || p.data.empty() || p.tokens.n_tokens() <= 0) {
-        return false;
-    }
+bool server_prompt_cache::write_kv_file_atomic(const std::string & fname,
+                                               const server_prompt & p,
+                                               disk_save_reason reason) {
+    if (disk_dir.empty()) return false;
 
     namespace fs = std::filesystem;
-
-    const int64_t t_start = ggml_time_us();
-
     std::error_code ec;
     fs::create_directories(disk_dir, ec);
     if (ec) {
-        LLAMA_LOG_INFO(" - disk dump: cannot create %s: %s\n", disk_dir.c_str(), ec.message().c_str());
+        LLAMA_LOG_INFO(" - disk write: cannot create %s: %s\n", disk_dir.c_str(), ec.message().c_str());
         return false;
     }
 
-    // Zero-padded counter so filenames sort lexicographically by insertion
-    // order (matches mtime order and makes bootstrap counter-parsing trivial).
-    char fname_buf[40];
-    std::snprintf(fname_buf, sizeof(fname_buf), "prompt-%016llx.kv",
-                  (unsigned long long) next_disk_id);
-    const std::string fname     = fname_buf;
     const std::string fpath     = disk_dir + "/" + fname;
     const std::string fpath_tmp = fpath + ".tmp";
 
-    const uint32_t token_count  = (uint32_t) p.tokens.n_tokens();
-    const uint64_t data_size    = (uint64_t) p.data.size();
-    const uint8_t  chkpt_count  = (uint8_t) std::min(p.checkpoints.size(), (size_t) 255);
+    const uint32_t token_count = (uint32_t) p.tokens.n_tokens();
+    const uint64_t data_size   = (uint64_t) p.data.size();
+    const uint8_t  chkpt_count = (uint8_t) std::min(p.checkpoints.size(), (size_t) 255);
 
     kv_file_header hdr{};
     std::memcpy(hdr.magic, KV_MAGIC, sizeof(hdr.magic));
@@ -1417,16 +1446,13 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p, disk_save_reason reaso
 
     FILE * f = std::fopen(fpath_tmp.c_str(), "wb");
     if (f == nullptr) {
-        LLAMA_LOG_INFO(" - disk dump: cannot open %s for write\n", fpath_tmp.c_str());
+        LLAMA_LOG_INFO(" - disk write: cannot open %s for write\n", fpath_tmp.c_str());
         return false;
     }
 
     bool ok = std::fwrite(&hdr, sizeof(hdr), 1, f) == 1;
 
     if (ok) {
-        // Serialize llama_token (int32) as uint32 LE. Build a contiguous buffer
-        // to issue one fwrite; safer than relying on llama_token width matching
-        // uint32 on all platforms.
         std::vector<uint32_t> tok_buf;
         tok_buf.reserve(token_count);
         for (uint32_t i = 0; i < token_count; ++i) {
@@ -1439,7 +1465,6 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p, disk_save_reason reaso
         ok = std::fwrite(p.data.data(), 1, data_size, f) == data_size;
     }
 
-    // Serialize checkpoints (v2): fixed-size record followed by blob.
     if (ok) {
         size_t written = 0;
         for (const auto & chk : p.checkpoints) {
@@ -1463,19 +1488,48 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p, disk_save_reason reaso
 
     if (!ok) {
         std::remove(fpath_tmp.c_str());
-        LLAMA_LOG_INFO(" - disk dump: write failed, removed partial %s\n", fpath_tmp.c_str());
+        LLAMA_LOG_INFO(" - disk write: failed, removed partial %s\n", fpath_tmp.c_str());
         return false;
     }
 
-    // Atomic publication (rename within same filesystem is atomic on POSIX).
     if (std::rename(fpath_tmp.c_str(), fpath.c_str()) != 0) {
         std::remove(fpath_tmp.c_str());
-        LLAMA_LOG_INFO(" - disk dump: rename %s -> %s failed\n", fpath_tmp.c_str(), fpath.c_str());
+        LLAMA_LOG_INFO(" - disk write: rename %s -> %s failed\n", fpath_tmp.c_str(), fpath.c_str());
         return false;
     }
+
+    return true;
+}
+
+bool server_prompt_cache::dump_to_disk(server_prompt & p, disk_save_reason reason) {
+    if (p.tokens.has_mtmd_data()) {
+        LLAMA_LOG_INFO("%s", " - skipping disk demotion: prompt contains multimodal chunks (unsupported)\n");
+        return false;
+    }
+    if (disk_dir.empty() || p.data.empty() || p.tokens.n_tokens() <= 0) {
+        return false;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    // Zero-padded counter so filenames sort lexicographically by insertion
+    // order (matches mtime order and makes bootstrap counter-parsing trivial).
+    char fname_buf[40];
+    std::snprintf(fname_buf, sizeof(fname_buf), "prompt-%016llx.kv",
+                  (unsigned long long) next_disk_id);
+    const std::string fname = fname_buf;
+
+    if (!write_kv_file_atomic(fname, p, reason)) {
+        return false;
+    }
+
+    const uint32_t token_count = (uint32_t) p.tokens.n_tokens();
+    const uint64_t data_size   = (uint64_t) p.data.size();
+    const uint8_t  chkpt_count = (uint8_t) std::min(p.checkpoints.size(), (size_t) 255);
 
     p.disk_file      = fname;
     p.data_disk_size = data_size;
+    p.last_reason    = (uint8_t) reason;
     p.data.clear();
     p.data.shrink_to_fit();
     p.checkpoints.clear();
@@ -1487,6 +1541,37 @@ bool server_prompt_cache::dump_to_disk(server_prompt & p, disk_save_reason reaso
                    data_size / (1024.0 * 1024.0),
                    (ggml_time_us() - t_start) / 1000.0);
     return true;
+}
+
+bool server_prompt_cache::live_checkpoint(int32_t slot_id, server_prompt & snap) {
+    if (disk_dir.empty()) return false;
+    if (snap.tokens.has_mtmd_data()) return false;
+    if (snap.data.empty() || snap.tokens.n_tokens() <= 0) return false;
+    if ((size_t) snap.tokens.n_tokens() < n_min_disk) return false;
+
+    char fname_buf[32];
+    std::snprintf(fname_buf, sizeof(fname_buf), "slot-%d.kv", (int) slot_id);
+    const std::string fname = fname_buf;
+
+    const int64_t t_start = ggml_time_us();
+    const bool ok = write_kv_file_atomic(fname, snap, disk_save_reason::continued);
+    if (!ok) {
+        return false;
+    }
+
+    LLAMA_LOG_INFO(" - live checkpoint: wrote %s (%d tokens, %.3f MiB, %.2f ms)\n",
+                   fname.c_str(), snap.tokens.n_tokens(),
+                   snap.data.size() / (1024.0 * 1024.0),
+                   (ggml_time_us() - t_start) / 1000.0);
+    return true;
+}
+
+void server_prompt_cache::drop_live_checkpoint(int32_t slot_id) {
+    if (disk_dir.empty()) return;
+    char fname_buf[32];
+    std::snprintf(fname_buf, sizeof(fname_buf), "slot-%d.kv", (int) slot_id);
+    const std::string fpath = disk_dir + "/" + fname_buf;
+    std::remove(fpath.c_str()); // best effort; silent if missing
 }
 
 bool server_prompt_cache::restore_from_disk(server_prompt & p) {
@@ -1594,8 +1679,32 @@ bool server_prompt_cache::restore_from_disk(server_prompt & p) {
 
     p.disk_file.clear();
     p.data_disk_size = 0;
+    p.last_reason             = hdr.save_reason;
+    p.was_restored_from_disk  = true;
+    p.last_used_us            = ggml_time_us();
 
     return true;
+}
+
+size_t server_prompt_cache::flush_all_to_disk(disk_save_reason reason) {
+    if (disk_dir.empty()) return 0;
+
+    size_t demoted = 0;
+    for (auto & p : states) {
+        const bool ram_resident = !p.data.empty() && p.disk_file.empty();
+        if (!ram_resident) continue;
+        if ((size_t) p.n_tokens() < n_min_disk) continue;
+
+        if (dump_to_disk(p, reason)) {
+            ++demoted;
+        }
+    }
+
+    if (demoted > 0) {
+        LLAMA_LOG_INFO(" - disk flush: demoted %zu RAM entries (reason=%u)\n",
+                       demoted, (unsigned) reason);
+    }
+    return demoted;
 }
 
 void server_prompt_cache::enforce_disk_limit() {
@@ -1608,22 +1717,35 @@ void server_prompt_cache::enforce_disk_limit() {
 
     if (total_disk_size <= limit_disk_bytes) return;
 
-    // Disk entries sit after RAM entries in the list (spliced to end on demotion).
-    // Within the disk segment the oldest-demoted entry is first, so iterate
-    // forward and evict in order to get correct LRU behaviour.
-    auto it = states.begin();
-    while (it != states.end() && total_disk_size > limit_disk_bytes) {
-        if (!it->disk_file.empty()) {
-            std::string fpath = disk_dir + "/" + it->disk_file;
-            if (std::remove(fpath.c_str()) == 0) {
-                LLAMA_LOG_INFO(" - disk lru: unlinked %s (freed %.3f MiB)\n", it->disk_file.c_str(), it->data_disk_size / (1024.0 * 1024.0));
+    // Eviction priority by save_reason: cold and unknown go first (least
+    // valuable), then evict (RAM-pressure demotions), then shutdown (clean
+    // exit; keep when possible), then continued (entries observed in active
+    // use this session; kept longest). Within each class we still iterate in
+    // list order, which approximates mtime-LRU.
+    using R = disk_save_reason;
+    const R order[] = { R::cold, R::unknown, R::evict, R::shutdown, R::continued };
+
+    for (const R target : order) {
+        if (total_disk_size <= limit_disk_bytes) break;
+
+        auto it = states.begin();
+        while (it != states.end() && total_disk_size > limit_disk_bytes) {
+            const bool on_disk = !it->disk_file.empty();
+            const bool match   = (R) it->last_reason == target;
+            if (on_disk && match) {
+                std::string fpath = disk_dir + "/" + it->disk_file;
+                if (std::remove(fpath.c_str()) == 0) {
+                    LLAMA_LOG_INFO(" - disk lru: unlinked %s (reason=%u, freed %.3f MiB)\n",
+                                   it->disk_file.c_str(), (unsigned) it->last_reason,
+                                   it->data_disk_size / (1024.0 * 1024.0));
+                } else {
+                    LLAMA_LOG_INFO(" - disk lru: warning, failed to unlink %s\n", it->disk_file.c_str());
+                }
+                total_disk_size -= it->data_disk_size;
+                it = states.erase(it);
             } else {
-                LLAMA_LOG_INFO(" - disk lru: warning, failed to unlink %s\n", it->disk_file.c_str());
+                ++it;
             }
-            total_disk_size -= it->data_disk_size;
-            it = states.erase(it);
-        } else {
-            ++it;
         }
     }
 }
@@ -1639,17 +1761,20 @@ void server_prompt_cache::bootstrap_disk_tier() {
         return;
     }
 
-    int count = 0;
+    // Pass 1: scan the directory, drop .tmp orphans, classify regular entries
+    // (prompt-NNN.kv) vs live-checkpoint files (slot-N.kv). Tracks max_id from
+    // existing regular entries so we can give live checkpoints fresh IDs.
+    std::vector<std::string> prompt_files;
+    std::vector<std::string> slot_files;
     uint64_t max_id = 0;
     bool max_id_found = false;
 
-    for (const auto& entry : fs::directory_iterator(disk_dir, ec)) {
+    for (const auto & entry : fs::directory_iterator(disk_dir, ec)) {
         if (!entry.is_regular_file(ec)) continue;
-        
-        auto path = entry.path();
-        std::string fname = path.filename().string();
-        
-        // Remove left-over tmp files from previous crashes
+
+        const auto path = entry.path();
+        const std::string fname = path.filename().string();
+
         if (path.extension() == ".tmp") {
             std::remove(path.c_str());
             LLAMA_LOG_INFO(" - disk bootstrap: removed orphaned partial file %s\n", fname.c_str());
@@ -1658,22 +1783,55 @@ void server_prompt_cache::bootstrap_disk_tier() {
 
         if (path.extension() != ".kv") continue;
 
-        // Parse hex id: prompt-0123456789abcdef.kv
         if (fname.size() == 26 && fname.starts_with("prompt-")) {
-            std::string hex_str = fname.substr(7, 16);
             try {
-                uint64_t id = std::stoull(hex_str, nullptr, 16);
+                uint64_t id = std::stoull(fname.substr(7, 16), nullptr, 16);
                 if (!max_id_found || id > max_id) {
                     max_id = id;
                     max_id_found = true;
                 }
             } catch (...) {
-                // Invalid filename format, ignore
+                // not a parseable id; still treat as a regular file below
             }
+            prompt_files.push_back(fname);
+        } else if (fname.starts_with("slot-")) {
+            slot_files.push_back(fname);
         }
+        // any other .kv shape is ignored on purpose.
+    }
 
-        // Read header and tokens
-        FILE* f = std::fopen(path.c_str(), "rb");
+    // Pass 2: promote live-checkpoint files to regular entries by renaming
+    // them to prompt-<next_id>.kv. Without this step, the next run of the
+    // same slot id would atomically overwrite slot-N.kv via live_checkpoint
+    // and the entry loaded in Pass 3 would point at a file whose data_size
+    // no longer matches the stored data_disk_size, silently failing restore.
+    uint64_t next_id = max_id_found ? max_id + 1 : 0;
+    for (const auto & fname : slot_files) {
+        char dst_buf[40];
+        std::snprintf(dst_buf, sizeof(dst_buf), "prompt-%016llx.kv",
+                      (unsigned long long) next_id);
+        const std::string src_path = disk_dir + "/" + fname;
+        const std::string dst_path = disk_dir + "/" + dst_buf;
+        if (std::rename(src_path.c_str(), dst_path.c_str()) == 0) {
+            LLAMA_LOG_INFO(" - disk bootstrap: promoted live checkpoint %s -> %s\n",
+                           fname.c_str(), dst_buf);
+            prompt_files.push_back(dst_buf);
+            max_id = next_id;
+            max_id_found = true;
+            ++next_id;
+        } else {
+            LLAMA_LOG_INFO(" - disk bootstrap: failed to promote %s, removing\n", fname.c_str());
+            std::remove(src_path.c_str());
+        }
+    }
+
+    int count = 0;
+
+    // Pass 3: read each file's header + token blob and push into states.
+    for (const auto & fname : prompt_files) {
+        const std::string fpath = disk_dir + "/" + fname;
+
+        FILE * f = std::fopen(fpath.c_str(), "rb");
         if (!f) continue;
 
         kv_file_header hdr{};
@@ -1681,7 +1839,7 @@ void server_prompt_cache::bootstrap_disk_tier() {
             std::memcmp(hdr.magic, KV_MAGIC, sizeof(hdr.magic)) != 0 ||
             hdr.version != KV_VERSION) {
             std::fclose(f);
-            std::remove(path.c_str());
+            std::remove(fpath.c_str());
             LLAMA_LOG_INFO(" - disk bootstrap: removed corrupted file %s\n", fname.c_str());
             continue;
         }
@@ -1689,7 +1847,7 @@ void server_prompt_cache::bootstrap_disk_tier() {
         std::vector<uint32_t> tok_buf(hdr.token_count);
         if (hdr.token_count > 0 && std::fread(tok_buf.data(), sizeof(uint32_t), hdr.token_count, f) != hdr.token_count) {
             std::fclose(f);
-            std::remove(path.c_str());
+            std::remove(fpath.c_str());
             LLAMA_LOG_INFO(" - disk bootstrap: removed truncated file %s\n", fname.c_str());
             continue;
         }
@@ -1706,6 +1864,7 @@ void server_prompt_cache::bootstrap_disk_tier() {
         p.n_discarded_prompt = hdr.n_discarded_prompt;
         p.disk_file = fname;
         p.data_disk_size = hdr.data_size;
+        p.last_reason    = hdr.save_reason;
 
         states.push_back(std::move(p));
         count++;
@@ -1715,8 +1874,28 @@ void server_prompt_cache::bootstrap_disk_tier() {
         next_disk_id = max_id + 1;
     }
 
+    // Reorder by restore priority: entries that were actively in use or
+    // cleanly saved (continued, shutdown) come first so load() is more likely
+    // to hit them early; cold/unknown go last so they are also the first to
+    // be sacrificed by enforce_disk_limit. Stable sort preserves insertion
+    // order (≈ mtime) within each priority class.
+    auto priority = [](uint8_t r) -> int {
+        using R = disk_save_reason;
+        switch ((R) r) {
+            case R::continued: return 0;
+            case R::shutdown:  return 1;
+            case R::evict:     return 2;
+            case R::unknown:   return 3;
+            case R::cold:      return 4;
+        }
+        return 3;
+    };
+    states.sort([&](const server_prompt & a, const server_prompt & b) {
+        return priority(a.last_reason) < priority(b.last_reason);
+    });
+
     if (count > 0) {
-        LLAMA_LOG_INFO(" - disk bootstrap: loaded %d entries from %s (next id: %llu)\n", 
+        LLAMA_LOG_INFO(" - disk bootstrap: loaded %d entries from %s (next id: %llu)\n",
                        count, disk_dir.c_str(), (unsigned long long)next_disk_id);
     }
 }
